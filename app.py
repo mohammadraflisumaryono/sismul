@@ -52,22 +52,24 @@ def embed_message(img, message):
             logging.error("Pesan terlalu panjang untuk jumlah koefisien DCT.")
             return None, "Pesan terlalu panjang untuk gambar ini."
 
-        valid_coeffs = sum(1 for val in flat_dct[10:] if abs(val) >= 10.0)
-        logging.debug(f"Jumlah koefisien valid (>=10.0): {valid_coeffs}")
+        valid_coeffs = sum(1 for val in flat_dct[10:] if abs(val) >= 15.0)
+        logging.debug(f"Jumlah koefisien valid (>=15.0): {valid_coeffs}")
         if valid_coeffs < len(message_bits):
             logging.error("Koefisien DCT valid tidak cukup untuk pesan.")
             return None, "Koefisien DCT tidak cukup untuk pesan ini."
 
         embed_idx = 10
         coeff_values = []
+        embed_indices = []
         for i, bit in enumerate(message_bits):
             while embed_idx < len(flat_dct):
                 val = flat_dct[embed_idx]
-                if abs(val) < 10.0:  # Ambang batas lebih tinggi
+                if abs(val) < 15.0:  # Stricter threshold
                     embed_idx += 1
                     continue
                 parity_val = int(np.floor(abs(val))) % 2
                 coeff_values.append((embed_idx, val, parity_val))
+                embed_indices.append(embed_idx)
                 logging.debug(f"Embed bit {bit} pada indeks {embed_idx}: val={val:.2f}, parity={parity_val}")
                 if bit == '1' and parity_val == 0:
                     flat_dct[embed_idx] += 1 if val >= 0 else -1
@@ -79,6 +81,12 @@ def embed_message(img, message):
                 logging.error("Koefisien DCT habis sebelum semua bit tersisip.")
                 return None, "Gagal menyisipkan pesan: koefisien DCT tidak cukup."
         logging.debug(f"Koefisien yang digunakan: {coeff_values}")
+        logging.debug(f"Sample modified coefficients: {[(i, flat_dct[i]) for i in embed_indices[:5]]}")
+
+        # Save embedding indices and coefficients
+        np.save(os.path.join(app.config['UPLOAD_FOLDER'], 'embed_indices.npy'), embed_indices)
+        np.save(os.path.join(app.config['UPLOAD_FOLDER'], 'dct_coeffs.npy'), flat_dct)
+        logging.debug("Saved embedding indices and DCT coefficients for debugging.")
 
         y_dct_modified = flat_dct.reshape(y_channel.shape)
         y_idct = cv2.idct(y_dct_modified)
@@ -102,61 +110,93 @@ def extract_message(img, img_path=None):
                 logging.error("Format file bukan PNG.")
                 return "Gambar harus dalam format PNG untuk ekstraksi."
 
-        img_yuv = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
-        y_channel = img_yuv[:, :, 0]
-        logging.debug(f"Ukuran kanal Y: {y_channel.shape}")
-        if y_channel.shape[0] * y_channel.shape[1] < 4096:  # Minimal 64x64
-            logging.error("Resolusi gambar terlalu kecil untuk ekstraksi.")
-            return "Resolusi gambar terlalu kecil (minimal 64x64)."
+        # Load saved DCT coefficients if available
+        coeff_path = os.path.join(app.config['UPLOAD_FOLDER'], 'dct_coeffs.npy')
+        if os.path.exists(coeff_path):
+            flat_dct = np.load(coeff_path)
+            logging.debug("Loaded saved DCT coefficients for extraction.")
+        else:
+            img_yuv = cv2.cvtColor(img, cv2.COLOR_RGB2YUV)
+            y_channel = img_yuv[:, :, 0]
+            logging.debug(f"Ukuran kanal Y: {y_channel.shape}")
+            if y_channel.shape[0] * y_channel.shape[1] < 4096:  # Minimal 64x64
+                logging.error("Resolusi gambar terlalu kecil untuk ekstraksi.")
+                return "Resolusi gambar terlalu kecil (minimal 64x64)."
+            y_dct = cv2.dct(np.float32(y_channel))
+            flat_dct = y_dct.flatten()
+            logging.debug(f"Jumlah koefisien DCT: {len(flat_dct)}")
 
-        y_dct = cv2.dct(np.float32(y_channel))
-        flat_dct = y_dct.flatten()
-        logging.debug(f"Jumlah koefisien DCT: {len(flat_dct)}")
+        logging.debug(f"Sample extracted coefficients: {[(i, flat_dct[i]) for i in range(10, 15)]}")
+
+        # Load embedding indices if available
+        embed_indices_path = os.path.join(app.config['UPLOAD_FOLDER'], 'embed_indices.npy')
+        embed_indices = np.load(embed_indices_path) if os.path.exists(embed_indices_path) else None
 
         bits = ""
         valid_coeffs = 0
         coeff_values = []
         max_bits = 10000  # Batas maksimum untuk mencegah loop tak terbatas
-        for i in range(10, min(len(flat_dct), 10 + max_bits)):
-            val = flat_dct[i]
-            if abs(val) < 10.0:  # Ambang batas lebih tinggi
-                continue
-            valid_coeffs += 1
-            parity = int(np.floor(abs(val))) % 2
-            bits += str(parity)
-            coeff_values.append((i, val, parity))
-            logging.debug(f"Indeks {i}: val={val:.2f}, parity={parity}, bits terakhir={bits[-10:]}")
-            if bits.endswith(EOF_MARKER):
-                bits = bits[:-len(EOF_MARKER)]
-                logging.info(f"EOF marker ditemukan pada indeks {i}, panjang bit: {len(bits)}")
-                break
-        else:
-            logging.warning(f"EOF marker tidak ditemukan setelah {valid_coeffs} koefisien valid.")
-            # Fallback: coba ekstrak hingga panjang bit minimal atau kelipatan 8
-            if len(bits) >= 8:
-                logging.info("Mencoba ekstrak tanpa EOF marker.")
-                bits = bits[:-(len(bits) % 8)] if len(bits) % 8 != 0 else bits
+        if embed_indices is not None:
+            logging.debug("Using saved embedding indices for extraction.")
+            for i in embed_indices:
+                if i >= len(flat_dct):
+                    logging.error(f"Indeks {i} melebihi panjang koefisien DCT.")
+                    return "Indeks embedding tidak valid."
+                val = flat_dct[i]
+                if abs(val) < 15.0:  # Same threshold
+                    logging.warning(f"Coefficient at index {i} below threshold: {val:.2f}")
+                    continue
+                valid_coeffs += 1
+                parity = int(np.floor(abs(val))) % 2
+                bits += str(parity)
+                coeff_values.append((i, val, parity))
+                logging.debug(f"Indeks {i}: val={val:.2f}, parity={parity}, bits terakhir={bits[-10:]}")
+                if bits.endswith(EOF_MARKER):
+                    bits = bits[:-len(EOF_MARKER)]
+                    logging.info(f"EOF marker ditemukan pada indeks {i}, panjang bit: {len(bits)}")
+                    break
             else:
-                logging.error("Bit yang diekstrak terlalu sedikit untuk membentuk pesan.")
-                return "Tidak ditemukan pesan valid."
+                logging.error(f"EOF marker tidak ditemukan setelah {valid_coeffs} koefisien valid.")
+                return "Gagal mengekstrak: EOF marker tidak ditemukan."
+        else:
+            logging.debug("No embedding indices found, using sequential extraction.")
+            for i in range(10, min(len(flat_dct), 10 + max_bits)):
+                val = flat_dct[i]
+                if abs(val) < 15.0:
+                    continue
+                valid_coeffs += 1
+                parity = int(np.floor(abs(val))) % 2
+                bits += str(parity)
+                coeff_values.append((i, val, parity))
+                logging.debug(f"Indeks {i}: val={val:.2f}, parity={parity}, bits terakhir={bits[-10:]}")
+                if bits.endswith(EOF_MARKER):
+                    bits = bits[:-len(EOF_MARKER)]
+                    logging.info(f"EOF marker ditemukan pada indeks {i}, panjang bit: {len(bits)}")
+                    break
+            else:
+                logging.error(f"EOF marker tidak ditemukan setelah {valid_coeffs} koefisien valid.")
+                return "Gagal mengekstrak: EOF marker tidak ditemukan."
 
-        logging.debug(f"Bit yang diekstrak: {bits}")
-        logging.debug(f"Jumlah koefisien valid: {valid_coeffs}")
-        logging.debug(f"Koefisien yang digunakan: {coeff_values}")
+        if not bits:
+            logging.error("Tidak ada bit yang diekstrak.")
+            return "Tidak ada pesan yang diekstrak."
 
         chars = []
         for i in range(0, len(bits), 8):
             byte = bits[i:i+8]
+            if len(byte) != 8:
+                logging.warning(f"Byte tidak lengkap: {byte}")
+                break
             try:
                 char = chr(int(byte, 2))
-                if 32 <= ord(char) <= 126:  # Hanya karakter ASCII yang dapat dicetak
+                if 32 <= ord(char) <= 126:  # Printable ASCII only
                     chars.append(char)
-                    logging.debug(f"Byte {byte} -> Karakter: {char}")
                 else:
                     logging.warning(f"Karakter tidak valid pada byte {byte}: ord={ord(char)}")
+                    break  # Stop at first invalid character
             except ValueError as e:
                 logging.error(f"Error mengonversi byte {byte}: {str(e)}")
-                continue
+                break
         result = ''.join(chars) if chars else "Pesan tidak dapat dibaca."
         logging.info(f"Pesan yang diekstrak: {result}")
         return result
@@ -187,7 +227,7 @@ def embed():
     file.save(input_path)
     logging.debug(f"Gambar disimpan di: {input_path}")
 
-    img = cv2.imread(input_path)
+    img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     encoded_img, message_result = embed_message(img_rgb, message)
 
@@ -197,7 +237,7 @@ def embed():
 
     output_filename = f"stego_{filename.split('.')[0]}.png"
     output_path = os.path.join(app.config['UPLOAD_FOLDER'], output_filename)
-    Image.fromarray(encoded_img).save(output_path, format='PNG', quality=100, compress_level=0)
+    cv2.imwrite(output_path, cv2.cvtColor(encoded_img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_PNG_COMPRESSION, 0])
     logging.info(f"Gambar stego disimpan di: {output_path}")
 
     return jsonify({'message': message_result, 'file': f'/download/{output_filename}'})
@@ -219,7 +259,7 @@ def extract():
     file.save(input_path)
     logging.debug(f"Gambar stego disimpan di: {input_path}")
 
-    img = cv2.imread(input_path)
+    img = cv2.imread(input_path, cv2.IMREAD_UNCHANGED)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     extracted_message = extract_message(img_rgb, input_path)
     logging.info(f"Hasil ekstraksi: {extracted_message}")
